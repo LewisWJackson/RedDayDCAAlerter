@@ -1,0 +1,15 @@
+{
+  "trigger_count": 1,
+  "last_trigger_date": "2026-02-05",
+  "yesterday_close": null,
+  "yesterday_close_date": null,
+  "trigger_history": [
+    {
+      "number": 1,
+      "date": "2026-02-05",
+      "time": "2026-02-05T14:51:13.145542+00:00",
+      "price": 70207.63,
+      "type": "Manual trigger"
+    }
+  ]
+}

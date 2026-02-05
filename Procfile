@@ -1,1 +1,1 @@
-worker: python trigger_now.py
+worker: python main.py
