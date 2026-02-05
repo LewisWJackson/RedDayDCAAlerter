@@ -42,6 +42,9 @@ PERSONAL_EMAIL = "lewis@jackson.ventures"
 INTRADAY_DIP_THRESHOLD = -4.7  # Percentage drop from yesterday's close (intraday)
 CLOSE_TO_CLOSE_THRESHOLD = -3.3  # Percentage drop close-to-close
 
+# Special price level triggers (can fire same day as other triggers)
+PRICE_LEVEL_TRIGGERS = [50000, 40000]  # USD - triggers if BTC drops to or below these
+
 # Maximum triggers
 MAX_TRIGGERS = 15
 
@@ -102,7 +105,8 @@ def load_state():
         "last_trigger_date": None,
         "yesterday_close": None,
         "yesterday_close_date": None,
-        "trigger_history": []
+        "trigger_history": [],
+        "triggered_price_levels": []  # Track which $50K/$40K levels have been triggered
     }
 
     if STATE_FILE.exists():
@@ -246,97 +250,46 @@ def generate_broker_email(trigger_number, current_price, yesterday_close, drop_p
 
     total_amount = sum(assets.values())
 
-    # Build asset table
-    asset_rows = ""
+    # Build simple asset list for email
+    asset_lines_html = ""
+    asset_lines_text = ""
     for asset, amount in assets.items():
-        asset_rows += f"<tr><td style='padding: 8px; border: 1px solid #ddd;'>{asset}</td><td style='padding: 8px; border: 1px solid #ddd;'>£{amount:,.2f}</td></tr>\n"
+        asset_lines_html += f"<li>£{amount:,.2f} of {asset}</li>\n"
+        asset_lines_text += f"- £{amount:,.2f} of {asset}\n"
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    subject = f"BUY ORDER - Red Day DCA Trigger #{trigger_number} of {MAX_TRIGGERS}"
+    subject = "Buy Order"
 
     body_html = f"""
     <html>
     <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
-        <h2 style="color: #1a5f7a;">Buy Order Request</h2>
-
         <p>Hi Jake,</p>
 
-        <p>This is an automated buy order from Lewis's Red Day DCA strategy.</p>
+        <p>I'd like to place the following buy order:</p>
 
-        <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
-            <h3 style="margin-top: 0; color: #1a5f7a;">Trigger Details</h3>
-            <ul style="list-style: none; padding: 0;">
-                <li><strong>Trigger Number:</strong> {trigger_number} of {MAX_TRIGGERS}</li>
-                <li><strong>Trigger Type:</strong> {trigger_type}</li>
-                <li><strong>BTC Price:</strong> ${current_price:,.2f}</li>
-                <li><strong>Yesterday's Close:</strong> ${yesterday_close:,.2f}</li>
-                <li><strong>Drop:</strong> {drop_pct:.2f}%</li>
-                <li><strong>Timestamp:</strong> {timestamp}</li>
-            </ul>
-        </div>
+        <ul>
+{asset_lines_html}
+        </ul>
 
-        <h3 style="color: #1a5f7a;">Buy Order (Total: £{total_amount:,.2f})</h3>
+        <p>Please use available USDT, fiat USD, or fiat GBP to execute.</p>
 
-        <p><strong>Please process this order with immediate effect.</strong> Use available USDT or fiat USD balance to execute.</p>
+        <p>Please confirm once complete.</p>
 
-        <table style="border-collapse: collapse; width: 100%; max-width: 400px;">
-            <tr style="background-color: #1a5f7a; color: white;">
-                <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Asset</th>
-                <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Amount (GBP)</th>
-            </tr>
-            {asset_rows}
-            <tr style="background-color: #e8f4f8; font-weight: bold;">
-                <td style="padding: 8px; border: 1px solid #ddd;">TOTAL</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">£{total_amount:,.2f}</td>
-            </tr>
-        </table>
-
-        {"<p style='color: #d35400; font-weight: bold;'>⚠️ Note: This is trigger #{trigger_number} (every 3rd trigger) - includes additional BANANA and BONK purchases.</p>" if is_third_trigger else ""}
-
-        <p>Please confirm execution once complete.</p>
-
-        <p>Best regards,<br>Lewis</p>
-
-        <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
-        <p style="font-size: 12px; color: #888;">This is an automated message from Lewis's Red Day DCA Alert System.</p>
+        <p>Thanks,<br>Lewis</p>
     </body>
     </html>
     """
 
-    body_text = f"""
-BUY ORDER - Red Day DCA Trigger #{trigger_number} of {MAX_TRIGGERS}
+    body_text = f"""Hi Jake,
 
-Hi Jake,
+I'd like to place the following buy order:
 
-This is an automated buy order from Lewis's Red Day DCA strategy.
+{asset_lines_text}
+Please use available USDT, fiat USD, or fiat GBP to execute.
 
-TRIGGER DETAILS:
-- Trigger Number: {trigger_number} of {MAX_TRIGGERS}
-- Trigger Type: {trigger_type}
-- BTC Price: ${current_price:,.2f}
-- Yesterday's Close: ${yesterday_close:,.2f}
-- Drop: {drop_pct:.2f}%
-- Timestamp: {timestamp}
+Please confirm once complete.
 
-BUY ORDER (Total: £{total_amount:,.2f})
-Please process this order with immediate effect. Use available USDT or fiat USD balance.
-
-"""
-    for asset, amount in assets.items():
-        body_text += f"- {asset}: £{amount:,.2f}\n"
-
-    if is_third_trigger:
-        body_text += f"\n⚠️ Note: This is trigger #{trigger_number} (every 3rd trigger) - includes additional BANANA and BONK purchases.\n"
-
-    body_text += """
-Please confirm execution once complete.
-
-Best regards,
+Thanks,
 Lewis
-
----
-This is an automated message from Lewis's Red Day DCA Alert System.
 """
 
     return subject, body_html, body_text
@@ -477,12 +430,10 @@ def check_and_trigger():
         logger.info(f"Max triggers ({MAX_TRIGGERS}) already reached. System complete.")
         return
 
-    # Get current date
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    # Check if already triggered today
-    if state["last_trigger_date"] == today:
-        logger.debug(f"Already triggered today ({today}). Skipping.")
+    # Get current price first (needed for price level checks)
+    current_price = get_binance_btc_price()
+    if current_price is None:
+        logger.error("Could not fetch current price. Skipping check.")
         return
 
     # Get yesterday's close
@@ -498,18 +449,45 @@ def check_and_trigger():
         save_state(state)
         logger.info(f"Updated yesterday's close: ${yesterday_close:,.2f} ({yesterday_date})")
 
-    # Get current price
-    current_price = get_binance_btc_price()
-    if current_price is None:
-        logger.error("Could not fetch current price. Skipping check.")
-        return
-
     # Calculate intraday drop percentage
     drop_pct = ((current_price - yesterday_close) / yesterday_close) * 100
 
     logger.info(f"BTC: ${current_price:,.2f} | Yesterday: ${yesterday_close:,.2f} | Change: {drop_pct:+.2f}%")
 
-    # Check intraday trigger
+    # Get current date
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # =========================================================================
+    # CHECK SPECIAL PRICE LEVEL TRIGGERS (can fire multiple times per day)
+    # =========================================================================
+    for price_level in PRICE_LEVEL_TRIGGERS:
+        if current_price <= price_level and price_level not in state.get("triggered_price_levels", []):
+            logger.info(f"🔔 PRICE LEVEL TRIGGER! BTC ${current_price:,.2f} ≤ ${price_level:,}")
+            trigger_type = f"Price level (${price_level:,})"
+
+            # Execute trigger (this will increment count and send emails)
+            execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_type)
+
+            # Mark this price level as triggered
+            if "triggered_price_levels" not in state:
+                state["triggered_price_levels"] = []
+            state["triggered_price_levels"].append(price_level)
+            save_state(state)
+
+            # Reload state as execute_trigger modified it
+            state = load_state()
+
+            # Check if max triggers reached after this one
+            if state["trigger_count"] >= MAX_TRIGGERS:
+                return
+
+    # =========================================================================
+    # CHECK REGULAR INTRADAY TRIGGER (once per day max)
+    # =========================================================================
+    if state["last_trigger_date"] == today:
+        logger.debug(f"Already triggered today ({today}). Skipping intraday check.")
+        return
+
     triggered = False
     trigger_type = None
 
