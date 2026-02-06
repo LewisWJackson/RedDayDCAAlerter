@@ -42,8 +42,9 @@ PERSONAL_EMAIL = "lewis@jackson.ventures"
 INTRADAY_DIP_THRESHOLD = -4.7  # Percentage drop from yesterday's close (intraday)
 CLOSE_TO_CLOSE_THRESHOLD = -3.3  # Percentage drop close-to-close
 
-# Special price level triggers (can fire same day as other triggers)
-PRICE_LEVEL_TRIGGERS = [50000, 40000]  # USD - triggers if BTC drops to or below these
+# Special price level triggers (can fire same day as other triggers, once per day each)
+# Triggers when BTC drops DOWN through these levels
+PRICE_LEVEL_TRIGGERS = [52000, 51000, 50000, 40000]  # USD - must be in descending order
 
 # Maximum triggers
 MAX_TRIGGERS = 15
@@ -106,7 +107,9 @@ def load_state():
         "yesterday_close": None,
         "yesterday_close_date": None,
         "trigger_history": [],
-        "triggered_price_levels": []  # Track which $50K/$40K levels have been triggered
+        "last_price": None,  # Track last price to detect downward crosses
+        "price_levels_triggered_today": [],  # Which price levels triggered today (resets daily)
+        "price_levels_date": None  # Date for resetting price level triggers
     }
 
     if STATE_FILE.exists():
@@ -458,28 +461,48 @@ def check_and_trigger():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # =========================================================================
-    # CHECK SPECIAL PRICE LEVEL TRIGGERS (can fire multiple times per day)
+    # RESET DAILY PRICE LEVEL TRIGGERS IF NEW DAY
     # =========================================================================
-    for price_level in PRICE_LEVEL_TRIGGERS:
-        if current_price <= price_level and price_level not in state.get("triggered_price_levels", []):
-            logger.info(f"🔔 PRICE LEVEL TRIGGER! BTC ${current_price:,.2f} ≤ ${price_level:,}")
-            trigger_type = f"Price level (${price_level:,})"
+    if state.get("price_levels_date") != today:
+        state["price_levels_triggered_today"] = []
+        state["price_levels_date"] = today
+        save_state(state)
+        logger.info(f"New day - reset price level triggers")
 
-            # Execute trigger (this will increment count and send emails)
-            execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_type)
+    # =========================================================================
+    # CHECK SPECIAL PRICE LEVEL TRIGGERS (once per day each, on downward cross)
+    # =========================================================================
+    last_price = state.get("last_price")
 
-            # Mark this price level as triggered
-            if "triggered_price_levels" not in state:
-                state["triggered_price_levels"] = []
-            state["triggered_price_levels"].append(price_level)
-            save_state(state)
+    # Update last_price for next check (do this before checking triggers)
+    state["last_price"] = current_price
+    save_state(state)
 
-            # Reload state as execute_trigger modified it
-            state = load_state()
+    # Only check for downward crosses if we have a previous price
+    if last_price is not None:
+        for price_level in PRICE_LEVEL_TRIGGERS:
+            # Check if we crossed DOWN through this level
+            # (last price was above, current price is at or below)
+            crossed_down = last_price > price_level and current_price <= price_level
+            not_triggered_today = price_level not in state.get("price_levels_triggered_today", [])
 
-            # Check if max triggers reached after this one
-            if state["trigger_count"] >= MAX_TRIGGERS:
-                return
+            if crossed_down and not_triggered_today:
+                logger.info(f"🔔 PRICE LEVEL TRIGGER! BTC crossed down through ${price_level:,} (${last_price:,.2f} → ${current_price:,.2f})")
+                trigger_type = f"Price level (${price_level:,})"
+
+                # Execute trigger (this will increment count and send emails)
+                execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_type)
+
+                # Mark this price level as triggered today
+                state = load_state()  # Reload as execute_trigger modified it
+                if "price_levels_triggered_today" not in state:
+                    state["price_levels_triggered_today"] = []
+                state["price_levels_triggered_today"].append(price_level)
+                save_state(state)
+
+                # Check if max triggers reached after this one
+                if state["trigger_count"] >= MAX_TRIGGERS:
+                    return
 
     # =========================================================================
     # CHECK REGULAR INTRADAY TRIGGER (once per day max)
