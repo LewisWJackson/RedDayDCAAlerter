@@ -5,7 +5,10 @@
 |------|-----------|-------------|
 | Intraday Dip | ≤ -4.7% | Price drops 4.7%+ below yesterday's close at any point |
 | Close-to-Close | ≤ -3.3% | Daily candle closes 3.3%+ below prior close |
+| Consecutive Red | 3 days ≤ -1% | 3 consecutive daily closes each at least 1% red |
+| Price Level | Cross down | BTC crosses down through $52k, $51k, $50k, $40k |
 
+**Global rule**: All triggers require BTC < $69,000
 **Limits**: Max 1 trigger/day, Max 15 triggers total
 
 ---

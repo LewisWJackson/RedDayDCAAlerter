@@ -6,6 +6,10 @@ Automated price monitoring and alert system for Lewis's DCA strategy.
 Monitors BTC price and triggers buy alerts when:
 - Intraday: Price drops ≥4.7% below yesterday's close
 - OR Close-to-close: Price closes ≥3.3% down from prior close
+- OR 3 consecutive daily closes each ≥1% red
+- Price level triggers: BTC crosses down through key levels
+
+All triggers require BTC to be below $69,000.
 
 Sends emails to:
 1. Broker (Jake at Caleb & Brown) with crypto buy orders
@@ -41,6 +45,13 @@ PERSONAL_EMAIL = "lewis@jackson.ventures"
 # Trigger Thresholds
 INTRADAY_DIP_THRESHOLD = -4.7  # Percentage drop from yesterday's close (intraday)
 CLOSE_TO_CLOSE_THRESHOLD = -3.3  # Percentage drop close-to-close
+
+# Consecutive red days trigger
+CONSECUTIVE_RED_DAYS = 3  # Number of consecutive red closes required
+CONSECUTIVE_RED_THRESHOLD = -1.0  # Each day must be at least this % red (close-to-close)
+
+# Global price floor - ALL triggers require BTC to be below this price
+TRIGGER_PRICE_CEILING = 69000  # USD - no triggers fire above this
 
 # Special price level triggers (can fire same day as other triggers, once per day each)
 # Triggers when BTC drops DOWN through these levels
@@ -109,7 +120,9 @@ def load_state():
         "trigger_history": [],
         "last_price": None,  # Track last price to detect downward crosses
         "price_levels_triggered_today": [],  # Which price levels triggered today (resets daily)
-        "price_levels_date": None  # Date for resetting price level triggers
+        "price_levels_date": None,  # Date for resetting price level triggers
+        "daily_closes": [],  # Recent daily closes for consecutive red day detection [{date, close, change_pct}]
+        "consecutive_red_triggered_date": None  # Last date consecutive red trigger fired (prevent re-fire)
     }
 
     if STATE_FILE.exists():
@@ -457,6 +470,16 @@ def check_and_trigger():
 
     logger.info(f"BTC: ${current_price:,.2f} | Yesterday: ${yesterday_close:,.2f} | Change: {drop_pct:+.2f}%")
 
+    # =========================================================================
+    # GLOBAL PRICE CEILING CHECK - no triggers above this price
+    # =========================================================================
+    if current_price >= TRIGGER_PRICE_CEILING:
+        logger.info(f"BTC ${current_price:,.2f} is above ${TRIGGER_PRICE_CEILING:,} ceiling. No triggers allowed.")
+        # Still update last_price for downward cross detection
+        state["last_price"] = current_price
+        save_state(state)
+        return
+
     # Get current date
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -491,7 +514,7 @@ def check_and_trigger():
                 trigger_type = f"Price level (${price_level:,})"
 
                 # Execute trigger (this will increment count and send emails)
-                execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_type)
+                execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_type, is_price_level=True)
 
                 # Mark this price level as triggered today
                 state = load_state()  # Reload as execute_trigger modified it
@@ -524,7 +547,7 @@ def check_and_trigger():
 
 
 def check_daily_close():
-    """Check at end of day for close-to-close trigger."""
+    """Check at end of day for close-to-close trigger and consecutive red days."""
     state = load_state()
 
     # Check if we've already hit max triggers
@@ -532,10 +555,6 @@ def check_daily_close():
         return
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    # Check if already triggered today
-    if state["last_trigger_date"] == today:
-        return
 
     # Get today's close and yesterday's close
     today_close = get_today_close()
@@ -547,19 +566,81 @@ def check_daily_close():
     # Calculate close-to-close change
     drop_pct = ((today_close - yesterday_close) / yesterday_close) * 100
 
+    # =========================================================================
+    # TRACK DAILY CLOSES FOR CONSECUTIVE RED DAY DETECTION
+    # =========================================================================
+    daily_closes = state.get("daily_closes", [])
+
+    # Only add if we haven't already recorded today
+    if not daily_closes or daily_closes[-1].get("date") != today:
+        daily_closes.append({
+            "date": today,
+            "close": today_close,
+            "change_pct": drop_pct
+        })
+        # Keep only the last N days we need
+        state["daily_closes"] = daily_closes[-(CONSECUTIVE_RED_DAYS + 1):]
+        save_state(state)
+        logger.info(f"Recorded daily close: ${today_close:,.2f} ({drop_pct:+.2f}%)")
+
+    # =========================================================================
+    # PRICE CEILING CHECK
+    # =========================================================================
+    if today_close >= TRIGGER_PRICE_CEILING:
+        logger.info(f"BTC close ${today_close:,.2f} is above ${TRIGGER_PRICE_CEILING:,} ceiling. No triggers.")
+        return
+
+    # =========================================================================
+    # CHECK CONSECUTIVE RED DAYS TRIGGER
+    # =========================================================================
+    if (len(state["daily_closes"]) >= CONSECUTIVE_RED_DAYS
+            and state.get("consecutive_red_triggered_date") != today
+            and state["last_trigger_date"] != today):
+        recent = state["daily_closes"][-CONSECUTIVE_RED_DAYS:]
+        all_red = all(d["change_pct"] <= CONSECUTIVE_RED_THRESHOLD for d in recent)
+
+        if all_red:
+            dates_str = ", ".join(f"{d['date']} ({d['change_pct']:+.2f}%)" for d in recent)
+            trigger_type = f"Consecutive {CONSECUTIVE_RED_DAYS} red days ≤{CONSECUTIVE_RED_THRESHOLD}% each: {dates_str}"
+            logger.info(f"🔔 CONSECUTIVE RED DAYS TRIGGER! {dates_str}")
+
+            state["consecutive_red_triggered_date"] = today
+            save_state(state)
+
+            execute_trigger(state, today_close, yesterday_close, drop_pct, trigger_type)
+
+            # Reload state after trigger
+            state = load_state()
+            if state["trigger_count"] >= MAX_TRIGGERS:
+                return
+
+    # =========================================================================
+    # CHECK CLOSE-TO-CLOSE TRIGGER
+    # =========================================================================
+    if state["last_trigger_date"] == today:
+        return
+
     if drop_pct <= CLOSE_TO_CLOSE_THRESHOLD:
         trigger_type = f"Close-to-close ({drop_pct:.2f}% ≤ {CLOSE_TO_CLOSE_THRESHOLD}%)"
         logger.info(f"🔔 CLOSE-TO-CLOSE TRIGGER FIRED! Drop: {drop_pct:.2f}%")
         execute_trigger(state, today_close, yesterday_close, drop_pct, trigger_type)
 
 
-def execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_type):
-    """Execute the trigger: increment count, send emails."""
+def execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_type, is_price_level=False):
+    """Execute the trigger: increment count, send emails.
+
+    Price level triggers don't consume the daily regular trigger slot,
+    so they won't block intraday/close-to-close/consecutive red triggers.
+    """
 
     # Increment trigger count
     state["trigger_count"] += 1
     trigger_number = state["trigger_count"]
-    state["last_trigger_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Only set last_trigger_date for non-price-level triggers
+    # Price level triggers can co-exist with one regular trigger per day
+    if not is_price_level:
+        state["last_trigger_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Log trigger
     trigger_record = {
