@@ -1,6 +1,6 @@
 {
-  "trigger_count": 1,
-  "last_trigger_date": "2026-02-05",
+  "trigger_count": 3,
+  "last_trigger_date": "2026-02-24",
   "yesterday_close": null,
   "yesterday_close_date": null,
   "trigger_history": [
@@ -9,6 +9,20 @@
       "date": "2026-02-05",
       "time": "2026-02-05T14:51:13.145542+00:00",
       "price": 70207.63,
+      "type": "Manual trigger"
+    },
+    {
+      "number": 2,
+      "date": "2026-02-12",
+      "time": "2026-02-12T23:58:59.297364+00:00",
+      "price": 66267.21,
+      "type": "Manual trigger"
+    },
+    {
+      "number": 3,
+      "date": "2026-02-24",
+      "time": "2026-02-24T11:35:55.172923+00:00",
+      "price": 63099.99,
       "type": "Manual trigger"
     }
   ]
