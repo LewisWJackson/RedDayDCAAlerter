@@ -84,10 +84,9 @@ CORE_CRYPTO_ALLOCATIONS = {
     "TRAC": 333.33,
 }
 
-# Spec allocations - ONLY on every 3rd trigger (£100 each)
+# Spec allocations - ONLY on every 3rd trigger
 SPEC_CRYPTO_ALLOCATIONS = {
-    "BANANA": 100.00,
-    "BONK": 100.00,
+    "BONK": 200.00,  # £200 (was split with BANANA, but C&B don't carry BANANA)
 }
 
 # eToro equity allocations per trigger (£600 total)
