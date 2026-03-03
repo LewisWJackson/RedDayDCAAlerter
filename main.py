@@ -27,6 +27,8 @@ from pathlib import Path
 import requests
 import time
 import schedule
+import psycopg2
+from psycopg2.extras import Json
 
 # =============================================================================
 # CONFIGURATION
@@ -48,7 +50,9 @@ CLOSE_TO_CLOSE_THRESHOLD = -3.3  # Percentage drop close-to-close
 
 # Consecutive red days trigger
 CONSECUTIVE_RED_DAYS = 3  # Number of consecutive red closes required
-CONSECUTIVE_RED_THRESHOLD = -1.0  # Each day must be at least this % red (close-to-close)
+CONSECUTIVE_RED_THRESHOLD = (
+    -1.0
+)  # Each day must be at least this % red (close-to-close)
 
 # Global price floor - ALL triggers require BTC to be below this price
 TRIGGER_PRICE_CEILING = 69000  # USD - no triggers fire above this
@@ -98,60 +102,134 @@ ETORO_ALLOCATIONS = {
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('dca_alerter.log'),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("dca_alerter.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# STATE MANAGEMENT
+# STATE MANAGEMENT (PostgreSQL-backed, falls back to JSON file if no DB URL)
 # =============================================================================
 
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+DEFAULT_STATE = {
+    "trigger_count": 0,
+    "last_trigger_date": None,
+    "yesterday_close": None,
+    "yesterday_close_date": None,
+    "trigger_history": [],
+    "last_price": None,
+    "price_levels_triggered_today": [],
+    "price_levels_date": None,
+    "daily_closes": [],
+    "consecutive_red_triggered_date": None,
+}
+
+
+def get_db_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    """Create state table and seed from dca_state.json if empty."""
+    if not DATABASE_URL:
+        logger.warning("No DATABASE_URL — using local JSON file for state")
+        return
+
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS dca_state (
+                        id INTEGER PRIMARY KEY DEFAULT 1,
+                        state JSONB NOT NULL
+                    )
+                """)
+                # Seed from local JSON file if table is empty
+                cur.execute("SELECT COUNT(*) FROM dca_state")
+                if cur.fetchone()[0] == 0:
+                    seed = dict(DEFAULT_STATE)
+                    if STATE_FILE.exists():
+                        try:
+                            with open(STATE_FILE) as f:
+                                file_state = json.load(f)
+                            for key in DEFAULT_STATE:
+                                if key in file_state:
+                                    seed[key] = file_state[key]
+                            logger.info("Seeded DB state from dca_state.json")
+                        except Exception as e:
+                            logger.warning(
+                                f"Could not read state file for seeding: {e}"
+                            )
+                    cur.execute(
+                        "INSERT INTO dca_state (id, state) VALUES (1, %s)",
+                        (Json(seed),),
+                    )
+                conn.commit()
+        logger.info("DB initialised")
+    except Exception as e:
+        logger.error(f"DB init failed: {e}")
+        raise
+
+
 def load_state():
-    """Load persisted state from file."""
-    default_state = {
-        "trigger_count": 0,
-        "last_trigger_date": None,
-        "yesterday_close": None,
-        "yesterday_close_date": None,
-        "trigger_history": [],
-        "last_price": None,  # Track last price to detect downward crosses
-        "price_levels_triggered_today": [],  # Which price levels triggered today (resets daily)
-        "price_levels_date": None,  # Date for resetting price level triggers
-        "daily_closes": [],  # Recent daily closes for consecutive red day detection [{date, close, change_pct}]
-        "consecutive_red_triggered_date": None  # Last date consecutive red trigger fired (prevent re-fire)
-    }
-
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE, 'r') as f:
-                state = json.load(f)
-                # Merge with defaults for any missing keys
-                for key in default_state:
+    """Load state from DB (or JSON file if no DB)."""
+    if not DATABASE_URL:
+        if STATE_FILE.exists():
+            try:
+                with open(STATE_FILE) as f:
+                    state = json.load(f)
+                for key in DEFAULT_STATE:
                     if key not in state:
-                        state[key] = default_state[key]
+                        state[key] = DEFAULT_STATE[key]
                 return state
-        except Exception as e:
-            logger.error(f"Error loading state: {e}")
+            except Exception as e:
+                logger.error(f"Error loading state file: {e}")
+        return dict(DEFAULT_STATE)
 
-    return default_state
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT state FROM dca_state WHERE id = 1")
+                row = cur.fetchone()
+                if row:
+                    state = row[0]
+                    for key in DEFAULT_STATE:
+                        if key not in state:
+                            state[key] = DEFAULT_STATE[key]
+                    return state
+    except Exception as e:
+        logger.error(f"Error loading state from DB: {e}")
+
+    return dict(DEFAULT_STATE)
 
 
 def save_state(state):
-    """Persist state to file."""
+    """Persist state to DB (or JSON file if no DB)."""
+    if not DATABASE_URL:
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving state file: {e}")
+        return
+
     try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dca_state SET state = %s WHERE id = 1", (Json(state),)
+                )
+            conn.commit()
     except Exception as e:
-        logger.error(f"Error saving state: {e}")
+        logger.error(f"Error saving state to DB: {e}")
 
 
 # =============================================================================
 # PRICE DATA FUNCTIONS
 # =============================================================================
+
 
 def get_binance_btc_price():
     """Get current BTC/USDT price from Binance."""
@@ -171,11 +249,7 @@ def get_binance_daily_close(days_ago=1):
     """Get BTC daily close from Binance klines."""
     try:
         url = "https://api.binance.com/api/v3/klines"
-        params = {
-            "symbol": "BTCUSDT",
-            "interval": "1d",
-            "limit": days_ago + 1
-        }
+        params = {"symbol": "BTCUSDT", "interval": "1d", "limit": days_ago + 1}
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
@@ -197,11 +271,7 @@ def get_today_close():
     """Get today's closing price (if the day has ended in UTC)."""
     try:
         url = "https://api.binance.com/api/v3/klines"
-        params = {
-            "symbol": "BTCUSDT",
-            "interval": "1d",
-            "limit": 1
-        }
+        params = {"symbol": "BTCUSDT", "interval": "1d", "limit": 1}
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
@@ -223,6 +293,7 @@ def get_today_close():
 # =============================================================================
 # EMAIL FUNCTIONS
 # =============================================================================
+
 
 def send_email(to_email, subject, body_html, body_text=None):
     """Send an email using SMTP."""
@@ -253,7 +324,9 @@ def send_email(to_email, subject, body_html, body_text=None):
         return False
 
 
-def generate_broker_email(trigger_number, current_price, yesterday_close, drop_pct, trigger_type):
+def generate_broker_email(
+    trigger_number, current_price, yesterday_close, drop_pct, trigger_type
+):
     """Generate email content for Jake at Caleb & Brown."""
 
     # Determine if this is a 3rd trigger (includes spec assets)
@@ -311,7 +384,9 @@ Lewis
     return subject, body_html, body_text
 
 
-def generate_personal_email(trigger_number, current_price, yesterday_close, drop_pct, trigger_type):
+def generate_personal_email(
+    trigger_number, current_price, yesterday_close, drop_pct, trigger_type
+):
     """Generate email content for Lewis (eToro notification)."""
 
     total_etoro = sum(ETORO_ALLOCATIONS.values())
@@ -437,6 +512,7 @@ Red Day DCA Alert System
 # TRIGGER LOGIC
 # =============================================================================
 
+
 def check_and_trigger():
     """Main function to check price and potentially trigger alerts."""
     state = load_state()
@@ -463,18 +539,24 @@ def check_and_trigger():
         state["yesterday_close"] = yesterday_close
         state["yesterday_close_date"] = yesterday_date
         save_state(state)
-        logger.info(f"Updated yesterday's close: ${yesterday_close:,.2f} ({yesterday_date})")
+        logger.info(
+            f"Updated yesterday's close: ${yesterday_close:,.2f} ({yesterday_date})"
+        )
 
     # Calculate intraday drop percentage
     drop_pct = ((current_price - yesterday_close) / yesterday_close) * 100
 
-    logger.info(f"BTC: ${current_price:,.2f} | Yesterday: ${yesterday_close:,.2f} | Change: {drop_pct:+.2f}%")
+    logger.info(
+        f"BTC: ${current_price:,.2f} | Yesterday: ${yesterday_close:,.2f} | Change: {drop_pct:+.2f}%"
+    )
 
     # =========================================================================
     # GLOBAL PRICE CEILING CHECK - no triggers above this price
     # =========================================================================
     if current_price >= TRIGGER_PRICE_CEILING:
-        logger.info(f"BTC ${current_price:,.2f} is above ${TRIGGER_PRICE_CEILING:,} ceiling. No triggers allowed.")
+        logger.info(
+            f"BTC ${current_price:,.2f} is above ${TRIGGER_PRICE_CEILING:,} ceiling. No triggers allowed."
+        )
         # Still update last_price for downward cross detection
         state["last_price"] = current_price
         save_state(state)
@@ -507,14 +589,25 @@ def check_and_trigger():
             # Check if we crossed DOWN through this level
             # (last price was above, current price is at or below)
             crossed_down = last_price > price_level and current_price <= price_level
-            not_triggered_today = price_level not in state.get("price_levels_triggered_today", [])
+            not_triggered_today = price_level not in state.get(
+                "price_levels_triggered_today", []
+            )
 
             if crossed_down and not_triggered_today:
-                logger.info(f"🔔 PRICE LEVEL TRIGGER! BTC crossed down through ${price_level:,} (${last_price:,.2f} → ${current_price:,.2f})")
+                logger.info(
+                    f"🔔 PRICE LEVEL TRIGGER! BTC crossed down through ${price_level:,} (${last_price:,.2f} → ${current_price:,.2f})"
+                )
                 trigger_type = f"Price level (${price_level:,})"
 
                 # Execute trigger (this will increment count and send emails)
-                execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_type, is_price_level=True)
+                execute_trigger(
+                    state,
+                    current_price,
+                    yesterday_close,
+                    drop_pct,
+                    trigger_type,
+                    is_price_level=True,
+                )
 
                 # Mark this price level as triggered today
                 state = load_state()  # Reload as execute_trigger modified it
@@ -573,13 +666,11 @@ def check_daily_close():
 
     # Only add if we haven't already recorded today
     if not daily_closes or daily_closes[-1].get("date") != today:
-        daily_closes.append({
-            "date": today,
-            "close": today_close,
-            "change_pct": drop_pct
-        })
+        daily_closes.append(
+            {"date": today, "close": today_close, "change_pct": drop_pct}
+        )
         # Keep only the last N days we need
-        state["daily_closes"] = daily_closes[-(CONSECUTIVE_RED_DAYS + 1):]
+        state["daily_closes"] = daily_closes[-(CONSECUTIVE_RED_DAYS + 1) :]
         save_state(state)
         logger.info(f"Recorded daily close: ${today_close:,.2f} ({drop_pct:+.2f}%)")
 
@@ -587,20 +678,26 @@ def check_daily_close():
     # PRICE CEILING CHECK
     # =========================================================================
     if today_close >= TRIGGER_PRICE_CEILING:
-        logger.info(f"BTC close ${today_close:,.2f} is above ${TRIGGER_PRICE_CEILING:,} ceiling. No triggers.")
+        logger.info(
+            f"BTC close ${today_close:,.2f} is above ${TRIGGER_PRICE_CEILING:,} ceiling. No triggers."
+        )
         return
 
     # =========================================================================
     # CHECK CONSECUTIVE RED DAYS TRIGGER
     # =========================================================================
-    if (len(state["daily_closes"]) >= CONSECUTIVE_RED_DAYS
-            and state.get("consecutive_red_triggered_date") != today
-            and state["last_trigger_date"] != today):
+    if (
+        len(state["daily_closes"]) >= CONSECUTIVE_RED_DAYS
+        and state.get("consecutive_red_triggered_date") != today
+        and state["last_trigger_date"] != today
+    ):
         recent = state["daily_closes"][-CONSECUTIVE_RED_DAYS:]
         all_red = all(d["change_pct"] <= CONSECUTIVE_RED_THRESHOLD for d in recent)
 
         if all_red:
-            dates_str = ", ".join(f"{d['date']} ({d['change_pct']:+.2f}%)" for d in recent)
+            dates_str = ", ".join(
+                f"{d['date']} ({d['change_pct']:+.2f}%)" for d in recent
+            )
             trigger_type = f"Consecutive {CONSECUTIVE_RED_DAYS} red days ≤{CONSECUTIVE_RED_THRESHOLD}% each: {dates_str}"
             logger.info(f"🔔 CONSECUTIVE RED DAYS TRIGGER! {dates_str}")
 
@@ -626,7 +723,9 @@ def check_daily_close():
         execute_trigger(state, today_close, yesterday_close, drop_pct, trigger_type)
 
 
-def execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_type, is_price_level=False):
+def execute_trigger(
+    state, current_price, yesterday_close, drop_pct, trigger_type, is_price_level=False
+):
     """Execute the trigger: increment count, send emails.
 
     Price level triggers don't consume the daily regular trigger slot,
@@ -650,7 +749,7 @@ def execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_typ
         "price": current_price,
         "yesterday_close": yesterday_close,
         "drop_pct": drop_pct,
-        "type": trigger_type
+        "type": trigger_type,
     }
     state["trigger_history"].append(trigger_record)
 
@@ -735,12 +834,14 @@ def send_completion_email():
 # MAIN SCHEDULER
 # =============================================================================
 
+
 def main():
     """Main entry point - runs the monitoring loop."""
     logger.info("=" * 60)
     logger.info("RED DAY DCA ALERTER STARTING")
     logger.info("=" * 60)
 
+    init_db()
     state = load_state()
     logger.info(f"Current trigger count: {state['trigger_count']} of {MAX_TRIGGERS}")
 
