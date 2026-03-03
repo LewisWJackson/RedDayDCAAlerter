@@ -45,7 +45,8 @@ BROKER_EMAIL = "jake@calebandbrown.com"
 PERSONAL_EMAIL = "lewis@jackson.ventures"
 
 # Trigger Thresholds
-INTRADAY_DIP_THRESHOLD = -4.7  # Percentage drop from yesterday's close (intraday)
+# Tiered intraday: each level fires independently within a single day
+INTRADAY_THRESHOLDS = [-4.7, -7.0, -9.5, -12.0]
 CLOSE_TO_CLOSE_THRESHOLD = -3.3  # Percentage drop close-to-close
 
 # Consecutive red days trigger
@@ -122,6 +123,8 @@ DEFAULT_STATE = {
     "last_price": None,
     "price_levels_triggered_today": [],
     "price_levels_date": None,
+    "intraday_levels_triggered_today": [],
+    "intraday_levels_date": None,
     "daily_closes": [],
     "consecutive_red_triggered_date": None,
 }
@@ -566,13 +569,19 @@ def check_and_trigger():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # =========================================================================
-    # RESET DAILY PRICE LEVEL TRIGGERS IF NEW DAY
+    # RESET DAILY TRIGGERS IF NEW DAY
     # =========================================================================
     if state.get("price_levels_date") != today:
         state["price_levels_triggered_today"] = []
         state["price_levels_date"] = today
         save_state(state)
         logger.info(f"New day - reset price level triggers")
+
+    if state.get("intraday_levels_date") != today:
+        state["intraday_levels_triggered_today"] = []
+        state["intraday_levels_date"] = today
+        save_state(state)
+        logger.info(f"New day - reset intraday tier triggers")
 
     # =========================================================================
     # CHECK SPECIAL PRICE LEVEL TRIGGERS (once per day each, on downward cross)
@@ -621,22 +630,32 @@ def check_and_trigger():
                     return
 
     # =========================================================================
-    # CHECK REGULAR INTRADAY TRIGGER (once per day max)
+    # CHECK TIERED INTRADAY TRIGGERS (each level fires independently per day)
     # =========================================================================
-    if state["last_trigger_date"] == today:
-        logger.debug(f"Already triggered today ({today}). Skipping intraday check.")
-        return
+    for threshold in INTRADAY_THRESHOLDS:
+        if drop_pct <= threshold and threshold not in state.get(
+            "intraday_levels_triggered_today", []
+        ):
+            trigger_type = f"Intraday tier {threshold}% (drop: {drop_pct:.2f}%)"
+            logger.info(
+                f"🔔 INTRADAY TIER TRIGGER! {threshold}% breached. Drop: {drop_pct:.2f}%"
+            )
 
-    triggered = False
-    trigger_type = None
+            execute_trigger(
+                state,
+                current_price,
+                yesterday_close,
+                drop_pct,
+                trigger_type,
+                is_price_level=True,
+            )
 
-    if drop_pct <= INTRADAY_DIP_THRESHOLD:
-        triggered = True
-        trigger_type = f"Intraday dip ({drop_pct:.2f}% ≤ {INTRADAY_DIP_THRESHOLD}%)"
-        logger.info(f"🔔 INTRADAY TRIGGER FIRED! Drop: {drop_pct:.2f}%")
+            state = load_state()
+            state["intraday_levels_triggered_today"].append(threshold)
+            save_state(state)
 
-    if triggered:
-        execute_trigger(state, current_price, yesterday_close, drop_pct, trigger_type)
+            if state["trigger_count"] >= MAX_TRIGGERS:
+                return
 
 
 def check_daily_close():
